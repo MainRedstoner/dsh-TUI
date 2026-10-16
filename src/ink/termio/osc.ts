@@ -161,8 +161,9 @@ export async function tmuxLoadBuffer(text: string): Promise<boolean> {
  * Local (no SSH_CONNECTION): also shell out to a native clipboard utility.
  * OSC 52 and tmux -w both depend on terminal settings — iTerm2 disables
  * OSC 52 by default, VS Code shows a permission prompt on first use. Native
- * utilities (pbcopy/wl-copy/xclip/xsel/clip.exe) always work locally. Over
- * SSH these would write to the remote clipboard — OSC 52 is the right path there.
+ * utilities (pbcopy/wl-copy/xclip/xsel/PowerShell Set-Clipboard) always
+ * work locally. Over SSH these would write to the remote clipboard — OSC 52
+ * is the right path there.
  *
  * @param text - the text to place on the clipboard.
  * @returns the sequence for the caller to write to stdout (raw OSC 52
@@ -242,11 +243,23 @@ function copyNative(text: string): void {
       })
       return
     }
-    case 'win32':
-      // clip.exe is always available on Windows. Unicode handling is
-      // imperfect (system locale encoding) but good enough for a fallback.
-      void execFileNoThrow('clip', [], opts)
+    case 'win32': {
+      // clip.exe decodes piped stdin with the console code page (GBK/936 on
+      // zh-CN systems), so the UTF-8 bytes land on the clipboard as mojibake
+      // (Chinese/Japanese/emoji). Set-Clipboard behind an explicit UTF-8
+      // reader over stdin is code-page independent — the same route
+      // claude-code shipped for /copy on Windows.
+      const script = [
+        '$sr=[System.IO.StreamReader]::new([Console]::OpenStandardInput(),[System.Text.UTF8Encoding]::new($false))',
+        'Set-Clipboard -Value $sr.ReadToEnd()',
+      ].join(';')
+      void execFileNoThrow(
+        'powershell',
+        ['-NoProfile', '-NonInteractive', '-Command', script],
+        { input: text, useCwd: false, timeout: 5000 },
+      )
       return
+    }
   }
 }
 

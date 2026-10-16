@@ -36,7 +36,7 @@
 export {} // 模块边界：避免顶层 await/全局名与其他 verify 脚本冲突
 
 // 强制纯 OSC 52 路径：K 组要调真实 Ink.copySelectionNoClear()，而 setClipboard()
-// 会先 fire-and-forget 一次本机剪贴板工具（Windows 上是 clip.exe）、再 await
+// 会先 fire-and-forget 一次本机剪贴板工具（Windows 上是 PowerShell Set-Clipboard）、再 await
 // tmux load-buffer。两者都不是本脚本要测的东西，且会让断言依赖宿主环境
 // （同 scripts/verify-copy-on-select.mjs 的处理）。
 process.env['SSH_CONNECTION'] = 'headless-test'
