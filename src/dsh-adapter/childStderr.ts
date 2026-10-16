@@ -18,6 +18,16 @@
  * Only fd 2 is touched; stdin/stdout keep their requested modes, so MCP's
  * JSON-RPC stdio channel is unaffected.
  *
+ * Ordering (issue #1578): the patch must exist before the FIRST spawn, and
+ * in the `dsh --profile` composition the mcp-client rows apply — and spawn
+ * their servers — before this package's plugin apply runs (their `inject`
+ * `['tools']` is satisfied while this package still waits on `agents`). So
+ * the guard is armed from `plugin.ts`'s module scope
+ * ({@link armChildStderrGuardEarly}), which the Loader evaluates in its
+ * import pass ahead of every apply; the sink attaches later, from `apply()`.
+ * Losing this race is silent — the child keeps the inherited fd and its
+ * first log line lands on the alt-screen.
+ *
  * Reachability note: the MCP SDK spawns via `cross-spawn`, which reads
  * `child_process.spawn` off the CJS exports object at call time, so this
  * patch covers it (verified by scripts/verify-child-stderr.tsx). A consumer
@@ -123,6 +133,55 @@ export function installChildStderrGuard(sink: (line: string) => void): () => voi
     if (childProcess.spawn === patched) {
       childProcess.spawn = original
     }
+  }
+}
+
+/**
+ * Lines drained before any sink attaches (see
+ * {@link armChildStderrGuardEarly}), capped so a never-attaching sink cannot
+ * grow the buffer without bound.
+ */
+const EARLY_BUFFER_CAP = 200
+
+let earlyArmed = false
+let currentSink: ((line: string) => void) | undefined
+let earlyBuffer: string[] = []
+
+/**
+ * Arm the guard at package-load time, before the Loader applies any row
+ * (issue #1578 — see the ordering note in the module header): drained lines
+ * arriving before a sink attaches are buffered (bounded) and flushed by
+ * {@link setChildStderrSink}. Idempotent: a second call is a no-op, so an
+ * explicit call from a consumer costs nothing.
+ */
+export function armChildStderrGuardEarly(): void {
+  if (earlyArmed) return
+  earlyArmed = true
+  installChildStderrGuard(line => {
+    if (currentSink !== undefined) {
+      currentSink(line)
+      return
+    }
+    if (earlyBuffer.length >= EARLY_BUFFER_CAP) earlyBuffer.shift()
+    earlyBuffer.push(line)
+  })
+}
+
+/**
+ * Attach the sink that consumes drained child-stderr lines, flushing the
+ * lines buffered before it existed. The patch itself stays armed for the
+ * process lifetime — a plugin reload must not open a window where an
+ * inherited stderr reaches the terminal again; detaching only stops delivery.
+ * @param sink - Consumer for drained lines.
+ * @returns A detach function that stops delivering to this sink.
+ */
+export function setChildStderrSink(sink: (line: string) => void): () => void {
+  currentSink = sink
+  const pending = earlyBuffer
+  earlyBuffer = []
+  for (const line of pending) sink(line)
+  return () => {
+    if (currentSink === sink) currentSink = undefined
   }
 }
 

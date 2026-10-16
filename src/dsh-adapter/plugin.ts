@@ -27,7 +27,7 @@ import { createChannelSceneOutlet } from './channel-scene-outlet.js'
 import { mountChannelUi } from './channel-ui.js'
 import { bindChannelCommands } from './channel/commands.js'
 import { registerTuiChannel } from '../adapter/channel/host-registry.js'
-import { createChildStderrReporter, installChildStderrGuard } from './childStderr.js'
+import { armChildStderrGuardEarly, createChildStderrReporter, setChildStderrSink } from './childStderr.js'
 import { removeClipboardImageDir } from '../utils/clipboard.js'
 import { appendCrashLog, serializeCrashDetail, unserializableCrashDetail, type CrashDetail } from '../utils/crashDetail.js'
 import { logForDebugging } from '../utils/debug.js'
@@ -214,6 +214,13 @@ export interface RuntimeApplyOptions {
   /** Filled with this runtime's exit funnel once mounted, cleared on teardown. */
   readonly exitSeam?: ProcessExitSeam
 }
+
+// Arm the child-stderr guard at module scope, ahead of every row's apply
+// (issue #1578): mcp-client rows spawn their servers before this package's
+// apply runs, so the spawn patch must already be in place when the Loader
+// imports this module. The reporter attaches its sink inside apply; startup
+// lines buffer until then.
+armChildStderrGuardEarly()
 
 export async function apply(ctx: Context, runtimeConfig: RuntimeConfig<Config>, configOwner: Context = ctx, runtimeOptions: RuntimeApplyOptions = {}): Promise<void> {
   const config = configValues<Config>(runtimeConfig)
@@ -449,10 +456,12 @@ export async function apply(ctx: Context, runtimeConfig: RuntimeConfig<Config>, 
   // Child-process stderr guard (issue #17): MCP servers spawned with an
   // inherited stderr (the MCP SDK's stdio default) write straight to the
   // terminal device from the child process, bypassing the renderer's own
-  // stderr patch and corrupting the alt-screen. Take over those spawns and
-  // surface their stderr as deduplicated notifications instead. Installed
-  // before agent resolution so servers spawned during startup are covered;
-  // notices posted before the channel exists are buffered and flushed then.
+  // stderr patch and corrupting the alt-screen. The spawn patch was armed at
+  // module scope (armChildStderrGuardEarly above — issue #1578: mcp-client
+  // rows apply and spawn before this apply runs); here we only attach the
+  // sink that turns drained lines into deduplicated notifications. Lines
+  // that arrived before this point flush in on attach; notices posted before
+  // the channel exists are buffered and flushed then.
   const stderrBacklog: Array<[string, { color?: 'error' | 'warning' | 'success'; timeoutMs?: number }?]> = []
   let notifyStderr: ((text: string, options?: { color?: 'error' | 'warning' | 'success'; timeoutMs?: number }) => void) | undefined
   const stderrReporter = createChildStderrReporter((text, options) => {
@@ -460,12 +469,12 @@ export async function apply(ctx: Context, runtimeConfig: RuntimeConfig<Config>, 
     else stderrBacklog.push([text, options])
   })
   ctx.effect(() => {
-    const restoreSpawn = installChildStderrGuard(line => {
+    const releaseSink = setChildStderrSink(line => {
       logForDebugging(`[child-stderr] ${line}`)
       stderrReporter.push(line)
     })
     return () => {
-      restoreSpawn()
+      releaseSink()
       stderrReporter.dispose()
     }
   })

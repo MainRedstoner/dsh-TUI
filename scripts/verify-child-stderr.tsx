@@ -12,6 +12,10 @@
  * unguarded. The fixture calls `spawn` through the default-import exports
  * object — the same access pattern cross-spawn (used by the MCP SDK) has.
  *
+ * The driver also covers the early arm (issue #1578): the guard is armed at
+ * module scope — before any row applies — and lines that arrive before the
+ * sink attaches must buffer and flush on attach, exactly once.
+ *
  * Driver mode additionally unit-tests the reporter: debounce dedup with a
  * repeat count, cooldown silence, ANSI stripping, truncation, empty lines.
  */
@@ -124,6 +128,28 @@ async function runDriver(): Promise<void> {
   check('空行/纯空白行被丢弃', notices.length === countBefore)
 
   reporter.dispose()
+
+  // ── early arm (issue #1578): armed at module scope, sink attaches later ──
+  // The ordering that broke: mcp-client rows spawn their servers before the
+  // plugin's apply runs, so the guard must already be armed when the module
+  // graph loads. Lines arriving before a sink attaches buffer, then flush.
+  const { armChildStderrGuardEarly, setChildStderrSink } = await import('../src/dsh-adapter/childStderr.js')
+  armChildStderrGuardEarly()
+  armChildStderrGuardEarly() // idempotent — must not double-deliver
+  // Default import = the CJS exports object read at call time, the same
+  // access the patch covers (an ESM named import would be snapshotted).
+  const cp = (await import('node:child_process')).default
+  const earlyChild = cp.spawn(process.execPath, ['-e', 'process.stderr.write("BOOM-EARLY\\n")'], {
+    stdio: ['ignore', 'ignore', 'inherit'],
+  } as never)
+  await new Promise(resolve => earlyChild.on('close', resolve))
+  // 固定窗:探针 等 stderr 管道的 data 事件送达：此时 sink 尚未挂载，没有可轮询的状态。
+  await sleep(250)
+  const earlyLines: string[] = []
+  const release = setChildStderrSink(line => earlyLines.push(line))
+  check('早装：sink 挂载前到达的行被缓冲、挂载时补齐', earlyLines.includes('BOOM-EARLY'))
+  check('早装：重复 arm 不重复投递', earlyLines.filter(line => line === 'BOOM-EARLY').length === 1)
+  release()
 
   console.log(results.join('\n'))
   if (failures > 0) {
