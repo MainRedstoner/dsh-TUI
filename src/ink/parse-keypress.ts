@@ -203,10 +203,11 @@ const KITTY_GRAPHICS_RE = /^\x1b_G([^;]*);([^\x1b]*)\x1b\\$/
 // Ctrl+F3 = CSI 1;5 R, etc.) — plain CSI row;col R is genuinely ambiguous.
 // eslint-disable-next-line no-control-regex
 const CURSOR_POSITION_RE = /^\x1b\[\?(\d+);(\d+)R$/
-// XTWINOPS pixel-size replies: CSI 6;height;width t (cell) and
-// CSI 4;height;width t (text area).
+// XTWINOPS replies: CSI 6;height;width t (cell pixels), CSI 4;height;width t
+// (text-area pixels), and CSI 8;rows;cols t (text-area character size, the
+// answer to CSI 18 t — see the resize watchdog in ink.tsx).
 // eslint-disable-next-line no-control-regex
-const TERMINAL_PIXEL_SIZE_RE = /^\x1b\[([46]);(\d+);(\d+)t$/
+const TERMINAL_PIXEL_SIZE_RE = /^\x1b\[([468]);(\d+);(\d+)t$/
 // OSC response: OSC code ; data (BEL|ST)
 // eslint-disable-next-line no-control-regex
 const OSC_RESPONSE_RE = /^\x1b\](\d+);(.*?)(?:\x07|\x1b\\)$/s
@@ -765,10 +766,12 @@ export type TerminalResponse =
   | { type: 'kittyGraphics'; imageId: number; status: string }
   /** DSR: cursor position report (answer to CSI 6 n) */
   | { type: 'cursorPosition'; row: number; col: number }
-  /** XTWINOPS: physical pixels for one cell or the terminal text area. */
+  /** XTWINOPS: physical pixels for one cell or the terminal text area
+   *  (`scope` 'cell'/'window'), or the text area's character size
+   *  (`scope` 'chars': width = columns, height = rows, reply `CSI 8;rows;cols t`). */
   | {
       type: 'terminalPixelSize'
-      scope: 'cell' | 'window'
+      scope: 'cell' | 'window' | 'chars'
       height: number
       width: number
     }
@@ -842,7 +845,7 @@ function parseTerminalResponse(s: string): TerminalResponse | null {
     if ((m = TERMINAL_PIXEL_SIZE_RE.exec(s))) {
       return {
         type: 'terminalPixelSize',
-        scope: m[1] === '6' ? 'cell' : 'window',
+        scope: m[1] === '6' ? 'cell' : m[1] === '4' ? 'window' : 'chars',
         height: parseInt(m[2]!, 10),
         width: parseInt(m[3]!, 10),
       }
@@ -912,8 +915,8 @@ const INCOMPLETE_RESPONSE_PREFIXES: ReadonlyArray<
   ['cursorPosition', /^\x1b\[\?\d*(?:;\d*)?$/],
   // DA2: any `>`-parameter list.
   ['da2', /^\x1b\[>[\d;]*$/],
-  // XTWINOPS: `6;h;w t` / `4;h;w t`, up to the final byte.
-  ['terminalPixelSize', /^\x1b\[[46](?:;\d*){0,2}$/],
+  // XTWINOPS: `6;h;w t` / `4;h;w t` / `8;rows;cols t`, up to the final byte.
+  ['terminalPixelSize', /^\x1b\[[468](?:;\d*){0,2}$/],
   // XTVERSION: `P>` can still gain `|` and a payload; ST's ESC may flush.
   ['xtversion', /^\x1bP>(?:\|[^\x1b]*(?:\x1b)?)?$/],
 ]

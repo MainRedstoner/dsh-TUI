@@ -375,6 +375,10 @@ const GROUPS = {
 // 全屏拖选自动复制后保留选区，重复 release 不重复复制；选区高亮跳过
 // 行尾填充/空白行，并保留代码缩进、软换行分隔空格和 Unicode 字符。
     ['verify-copy-on-select', ['node', 'scripts/verify-copy-on-select.mjs']],
+// 尺寸看门狗回归（#1578）：Windows/Electron 宿主不派发 tty resize 事件，
+// 渲染器改用 XTWINOPS 18t 轮询文本区尺寸；应答变化必须重排并全量重绘，
+// 且 onRender 的 live 漂移守卫在看门狗激活时不得把新尺寸改回旧值。
+    ['verify-size-watchdog', ['node', '--import', 'tsx/esm', 'scripts/verify-size-watchdog.tsx']],
 // hover 事件性能与健壮性回归：同批 motion 保留兴趣边界（tooltip dwell
 // 不提前）、无兴趣矩形快路径跳过全树 hit-test，且渲染提交/帧边界/
 // 多 root 失效；拖拽 motion 逐事件到达。

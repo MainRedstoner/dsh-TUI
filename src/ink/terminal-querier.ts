@@ -146,6 +146,20 @@ export function terminalWindowSizePixels(): TerminalQuery<TerminalPixelSizeRespo
 }
 
 /**
+ * XTWINOPS: query the text area size in characters (CSI 18 t → CSI 8;rows;cols t).
+ * The resize watchdog (ink.tsx) uses it where the tty 'resize' event cannot
+ * be trusted — the Windows/Electron host never delivers one.
+ */
+export function terminalCharsSize(): TerminalQuery<TerminalPixelSizeResponse> {
+  return {
+    request: csi('18t'),
+    match: (r): r is TerminalPixelSizeResponse =>
+      r.type === 'terminalPixelSize' && r.scope === 'chars',
+    responseType: 'terminalPixelSize',
+  }
+}
+
+/**
  * DECXCPR: request cursor position with DEC-private marker (CSI ? 6 n).
  * Terminal replies with CSI ? row ; col R. The `?` marker is critical —
  * the plain DSR form (CSI 6 n → CSI row;col R) is ambiguous with

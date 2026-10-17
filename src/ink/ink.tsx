@@ -47,7 +47,7 @@ import { isDecstbmSafe, SYNC_OUTPUT_SUPPORTED, serializeDiff, supportsCursorStyl
 import { CURSOR_HOME, cursorMove, cursorPosition, cursorStyle, DISABLE_KITTY_KEYBOARD, DISABLE_MODIFY_OTHER_KEYS, DISABLE_WIN32_INPUT_MODE, ENABLE_KITTY_KEYBOARD, ENABLE_MODIFY_OTHER_KEYS, ENABLE_WIN32_INPUT_MODE, ERASE_SCREEN, ERASE_SCROLLBACK, SGR_RESET } from './termio/csi.js';
 import { DBP, DFE, DISABLE_MOUSE_TRACKING, ENABLE_MOUSE_TRACKING, ENTER_ALT_SCREEN, EXIT_ALT_SCREEN, HIDE_CURSOR, SHOW_CURSOR } from './termio/dec.js';
 import { CLEAR_ITERM2_PROGRESS, CLEAR_TAB_STATUS, setClipboard, supportsTabStatus, wrapForMultiplexer } from './termio/osc.js';
-import { decrqm, kittyGraphics, terminalCellSizePixels, terminalWindowSizePixels, xtversion } from './terminal-querier.js';
+import { decrqm, kittyGraphics, terminalCellSizePixels, terminalCharsSize, terminalWindowSizePixels, xtversion } from './terminal-querier.js';
 import { TerminalWriteProvider } from './useTerminalNotification.js';
 import { TerminalImagesContext } from './hooks/use-terminal-images.js';
 import { DEFAULT_TERMINAL_CELL_SIZE, resolveTerminalCellSize, type TerminalImagePlacement } from './terminal-image.js';
@@ -230,6 +230,20 @@ export default class Ink {
   // A ConPTY resize may discard terminal cells without changing the grid.
   // Consume once at the next scheduled paint, not once per resize event.
   private needsSurfaceRepaint = false;
+  // Size watchdog (issue #1578): the Windows/Electron host runs the CLI under
+  // ELECTRON_RUN_AS_NODE, which never delivers the tty 'resize' event and
+  // aborts the process on the tty handle's getWindowSize (measured on
+  // Electron 44), so stdout.columns/rows stay stale forever. Re-read the size
+  // from the terminal itself (XTWINOPS 18t) on a slow timer and route a
+  // change through handleResize. Default on only for that host;
+  // DSH_TUI_SIZE_WATCHDOG=1/0 forces it on/off elsewhere (tests).
+  private sizeWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+  private sizeWatchdogInFlight = false;
+  // When the watchdog owns the size, the live-size drift guard in onRender
+  // must stand down: it treats stdout.columns/rows as fresher than the cached
+  // size, but on this host those values are permanently stale and would undo
+  // every watchdog-driven resize.
+  private sizeWatchdogActive = false;
   // Set by handleResize: prepend ERASE_SCREEN to the next onRender's patches
   // INSIDE the BSU/ESU block so clear+paint is atomic. Writing ERASE_SCREEN
   // synchronously in handleResize would leave the screen blank for the ~80ms
@@ -442,9 +456,12 @@ export default class Ink {
   // clear the screen, then the debounce fires and clears again (double
   // blank→paint flicker). useVirtualScroll's height scaling already bounds
   // the per-resize cost; synchronous handling keeps dimensions consistent.
-  private handleResize = () => {
-    const cols = this.options.stdout.columns || 80;
-    const rows = this.options.stdout.rows || 24;
+  private handleResize = (explicitSize?: {
+    columns: number;
+    rows: number;
+  }) => {
+    const cols = explicitSize?.columns ?? (this.options.stdout.columns || 80);
+    const rows = explicitSize?.rows ?? (this.options.stdout.rows || 24);
     // Duplicate resize events normally leave both layout and surface intact.
     // ConPTY can rebuild the alt buffer during maximize with the SAME grid,
     // though: the cached frame then hides lost static cells forever (#891).
@@ -532,6 +549,71 @@ export default class Ink {
     if (this.currentNode !== null) {
       this.render(this.currentNode);
     }
+  };
+
+  /**
+   * Start the size watchdog where the tty 'resize' event cannot be trusted
+   * (issue #1578 — see the field comment). Idempotent; the timer is unref'd
+   * so it never keeps the process alive on its own.
+   */
+  private maybeStartSizeWatchdog(): void {
+    if (this.sizeWatchdogTimer !== null) return;
+    const forced = process.env.DSH_TUI_SIZE_WATCHDOG;
+    if (forced === '0') return;
+    const hostLacksResizeEvents =
+      forced === '1' ||
+      (process.platform === 'win32' && process.versions.electron !== undefined);
+    if (!hostLacksResizeEvents || !this.options.stdout.isTTY) return;
+    const timer = setInterval(this.pollTerminalSize, 1000);
+    timer.unref?.();
+    this.sizeWatchdogTimer = timer;
+    this.sizeWatchdogActive = true;
+  }
+
+  /**
+   * One size probe: ask the terminal for its text-area size in characters and
+   * route a changed answer through handleResize. The querier's DA1 sentinel
+   * bounds the round trip, so a terminal that ignores CSI 18 t costs one
+   * unanswered query, not a timeout. The size-match fast path keeps steady
+   * state a no-op.
+   */
+  private pollTerminalSize = (): void => {
+    if (
+      this.isUnmounted ||
+      this.isPaused ||
+      this.terminalQueriesSuspended ||
+      !this.options.stdout.isTTY ||
+      this.sizeWatchdogInFlight
+    ) {
+      return;
+    }
+    const querier = this.app?.querier;
+    if (querier === undefined) return;
+    this.sizeWatchdogInFlight = true;
+    void Promise.all([querier.send(terminalCharsSize()), querier.flush()])
+      .then(([reply]) => {
+        if (
+          reply === undefined ||
+          this.isUnmounted ||
+          this.isPaused ||
+          this.terminalQueriesSuspended
+        ) {
+          return;
+        }
+        if (
+          reply.width === this.terminalColumns &&
+          reply.height === this.terminalRows
+        ) {
+          return;
+        }
+        this.handleResize({ columns: reply.width, rows: reply.height });
+      })
+      .catch(() => {
+        /* Size recovery is best-effort; the tty event path stays primary. */
+      })
+      .finally(() => {
+        this.sizeWatchdogInFlight = false;
+      });
   };
   resolveExitPromise: () => void = () => {};
   rejectExitPromise: (reason?: Error) => void = () => {};
@@ -754,7 +836,11 @@ export default class Ink {
     // correctly-laid-out frame.
     const liveColumns = this.options.stdout.columns || 80;
     const liveRows = this.options.stdout.rows || 24;
-    if (this.options.stdout.isTTY && (liveColumns !== this.terminalColumns || liveRows !== this.terminalRows)) {
+    if (
+      !this.sizeWatchdogActive &&
+      this.options.stdout.isTTY &&
+      (liveColumns !== this.terminalColumns || liveRows !== this.terminalRows)
+    ) {
       this.handleResize();
       return;
     }
@@ -2753,7 +2839,10 @@ export default class Ink {
   };
   private setAppRef(app: App | null): void {
     this.app = app;
-    if (app !== null) app.querier.onUnsolicited = this.handleUnsolicitedResponse;
+    if (app !== null) {
+      app.querier.onUnsolicited = this.handleUnsolicitedResponse;
+      this.maybeStartSizeWatchdog();
+    }
   }
   /**
    * Kitty placements report failures; an ENOENT means the terminal evicted a
@@ -2802,6 +2891,11 @@ export default class Ink {
     }
     this.restoreStderr?.();
     this.unsubscribeTTYHandlers?.();
+    if (this.sizeWatchdogTimer !== null) {
+      clearInterval(this.sizeWatchdogTimer);
+      this.sizeWatchdogTimer = null;
+      this.sizeWatchdogActive = false;
+    }
 
     // Non-TTY environments don't handle erasing ansi escapes well, so it's better to
     // only render last frame of non-static output
